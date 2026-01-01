@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import { Wallet } from 'ethers';
+import { ethers } from 'ethers';
 import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
 
 dotenv.config();
@@ -60,18 +60,33 @@ function formatSize(size) {
 async function setupClobClient() {
   console.log('🔑 Setting up CLOB client with private key...');
   
-  wallet = new Wallet(PRIVATE_KEY);
+  wallet = new ethers.Wallet(PRIVATE_KEY);
   const signerAddress = await wallet.getAddress();
   
-  console.log(`   Signer address: ${signerAddress}`);
-  console.log(`   Funder address: ${FUNDER_ADDRESS}`);
+  console.log(`   Signer (EOA) address: ${signerAddress}`);
+  console.log(`   Funder (Proxy) address: ${FUNDER_ADDRESS}`);
+  console.log(`   Signature Type: ${SIGNATURE_TYPE} (2 = Poly Proxy Wallet)`);
   console.log(`   Target wallet: ${TARGET_ADDRESS}`);
   
-  // Create or derive API credentials
-  const credentials = await new ClobClient(CLOB_API_URL, CHAIN_ID, wallet).createOrDeriveApiKey();
-  console.log('✅ API credentials obtained');
+  // IMPORTANT: For Polymarket proxy wallets, we need to derive credentials
+  // with the proxy wallet context from the start
   
-  // Create authenticated CLOB client with funder and signature type
+  // First, create client with proxy wallet settings to derive proper credentials
+  const initClient = new ClobClient(
+    CLOB_API_URL,
+    CHAIN_ID,
+    wallet,
+    undefined,  // no creds yet
+    SIGNATURE_TYPE,
+    FUNDER_ADDRESS
+  );
+  
+  // Create or derive API credentials (this signs with the proxy context)
+  const credentials = await initClient.createOrDeriveApiKey(FUNDER_ADDRESS);
+  console.log('✅ API credentials obtained');
+  console.log(`   API Key: ${credentials.apiKey?.slice(0, 20)}...`);
+  
+  // Create authenticated CLOB client with credentials
   clobClient = new ClobClient(
     CLOB_API_URL,
     CHAIN_ID,
@@ -81,7 +96,17 @@ async function setupClobClient() {
     FUNDER_ADDRESS
   );
   
+  // Verify the client is working by checking API key
+  try {
+    const apiKeys = await clobClient.getApiKeys();
+    console.log(`✅ API key verified, ${apiKeys.length} key(s) found`);
+  } catch (e) {
+    console.warn('⚠️  Could not verify API keys:', e.message);
+  }
+  
   console.log('✅ CLOB client ready for trading');
+  console.log('\n⚠️  IMPORTANT: Make sure your FUNDER_ADDRESS is your Polymarket proxy wallet');
+  console.log('   (Found under your profile picture on polymarket.com, NOT your MetaMask address)\n');
   
   return clobClient;
 }
@@ -98,27 +123,40 @@ async function mirrorTrade(tradeData) {
   console.log(`   Side: ${side} | Size: ${size} | Price: ${formatPrice(price)}`);
   
   try {
-    // Build order parameters
+    // Round price to valid tick size (0.001 increments, 0.01-0.99 range)
+    let roundedPrice = Math.round(parseFloat(price) * 1000) / 1000;
+    roundedPrice = Math.max(0.01, Math.min(0.99, roundedPrice));
+    
+    // Round size to 2 decimal places
+    const roundedSize = Math.round(parseFloat(size) * 100) / 100;
+    
+    const orderSide = side === 'BUY' ? Side.BUY : Side.SELL;
+    
+    // Build order parameters with all required fields
     const orderParams = {
       tokenID: asset,
-      side: side === 'BUY' ? Side.BUY : Side.SELL,
-      size: parseFloat(size),
-      price: parseFloat(price),
+      side: orderSide,
+      size: roundedSize,
+      price: roundedPrice,
+      feeRateBps: 0,
+      nonce: 0,
+      expiration: 0,
     };
     
-    console.log('📝 Creating order with params:', orderParams);
+    console.log('📝 Creating order with params:', JSON.stringify(orderParams, null, 2));
     
     // Step 1: Create the signed order
     const order = await clobClient.createOrder(orderParams);
     
     console.log('📤 Posting order to CLOB...');
+    console.log('   Order:', JSON.stringify(order, null, 2));
     
     // Step 2: Post the order (GTC = Good Till Cancelled)
     const result = await clobClient.postOrder(order, OrderType.GTC);
     
     console.log('✅ Order placed successfully!');
     console.log(`   Order ID: ${result.orderID || result.id || 'N/A'}`);
-    console.log(`   Status: ${result.status || 'submitted'}`);
+    console.log(`   Result:`, JSON.stringify(result, null, 2));
     
     return result;
   } catch (error) {
@@ -126,6 +164,7 @@ async function mirrorTrade(tradeData) {
     if (error.response?.data) {
       console.error('   API Error:', JSON.stringify(error.response.data));
     }
+    console.error('   Full error:', error);
     return null;
   }
 }
