@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 import { Wallet } from 'ethers';
-import { ClobClient } from '@polymarket/clob-client';
+import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
 
 dotenv.config();
 
@@ -87,7 +87,7 @@ async function setupClobClient() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TRADE MIRRORING (DISABLED - READ ONLY MODE)
+// TRADE MIRRORING - BUY/SELL EXECUTION
 // ═══════════════════════════════════════════════════════════════
 
 async function mirrorTrade(tradeData) {
@@ -98,23 +98,34 @@ async function mirrorTrade(tradeData) {
   console.log(`   Side: ${side} | Size: ${size} | Price: ${formatPrice(price)}`);
   
   try {
-    // Create market order to mirror the trade
-    const order = await clobClient.createMarketOrder({
+    // Build order parameters
+    const orderParams = {
       tokenID: asset,
-      side: side,
+      side: side === 'BUY' ? Side.BUY : Side.SELL,
       size: parseFloat(size),
-    });
+      price: parseFloat(price),
+    };
     
-    console.log('✅ Mirror order created:', order);
+    console.log('📝 Creating order with params:', orderParams);
     
-    // Place the order
-    const result = await clobClient.postOrder(order);
+    // Step 1: Create the signed order
+    const order = await clobClient.createOrder(orderParams);
+    
+    console.log('📤 Posting order to CLOB...');
+    
+    // Step 2: Post the order (GTC = Good Till Cancelled)
+    const result = await clobClient.postOrder(order, OrderType.GTC);
+    
     console.log('✅ Order placed successfully!');
     console.log(`   Order ID: ${result.orderID || result.id || 'N/A'}`);
+    console.log(`   Status: ${result.status || 'submitted'}`);
     
     return result;
   } catch (error) {
     console.error('❌ Failed to mirror trade:', error.message);
+    if (error.response?.data) {
+      console.error('   API Error:', JSON.stringify(error.response.data));
+    }
     return null;
   }
 }
@@ -138,13 +149,13 @@ function logTrade(trade) {
   console.log(`   Trader: ${trade.name || trade.pseudonym || trade.proxyWallet}`);
   console.log('═'.repeat(65));
   
-  // TODO: Enable when ready to trade
-  // mirrorTrade({
-  //   asset: trade.asset,
-  //   side: trade.side,
-  //   size: trade.size,
-  //   price: trade.price,
-  // });
+  // Mirror the trade
+  mirrorTrade({
+    asset: trade.asset,
+    side: trade.side,
+    size: trade.size,
+    price: trade.price,
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -258,7 +269,7 @@ function validateConfig() {
 async function main() {
   console.log('═══════════════════════════════════════════════════════════════');
   console.log('   POLYMARKET TRADE MIRROR');
-  console.log('   Real-time trade tracking via Data API (read-only mode)');
+  console.log('   Real-time trade tracking & execution via CLOB API');
   console.log('═══════════════════════════════════════════════════════════════\n');
   
   validateConfig();
