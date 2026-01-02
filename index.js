@@ -1,6 +1,9 @@
 import dotenv from 'dotenv';
-import { ethers } from 'ethers';
+import pkg from 'ethers';
+// const { Wallet } = pkg;
 import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
+import { Wallet } from '@ethersproject/wallet';
+import fs from 'fs';
 
 dotenv.config();
 
@@ -54,59 +57,39 @@ function formatSize(size) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// AUTH - SETUP CLOB CLIENT
+// AUTH - SETUP CLOB CLIENT (REPLICATED FROM My-Bot)
 // ═══════════════════════════════════════════════════════════════
 
 async function setupClobClient() {
-  console.log('🔑 Setting up CLOB client with private key...');
+  const host = 'https://clob.polymarket.com';
+  const funder = '0xa9456cecF9d6fb545F6408E0e2DbBFA307d7BaE6';
+  const privateKey = 'e77b39cfca7a712111553384b26d7e0d9b399e04db5891cc999964d22bc7700b';
   
-  wallet = new ethers.Wallet(PRIVATE_KEY);
-  const signerAddress = await wallet.getAddress();
+  if (!privateKey)
+    throw new Error('Private key is not set in environment variables');
   
-  console.log(`   Signer (EOA) address: ${signerAddress}`);
-  console.log(`   Funder (Proxy) address: ${FUNDER_ADDRESS}`);
-  console.log(`   Signature Type: ${SIGNATURE_TYPE} (2 = Poly Proxy Wallet)`);
-  console.log(`   Target wallet: ${TARGET_ADDRESS}`);
-  
-  // IMPORTANT: For Polymarket proxy wallets, we need to derive credentials
-  // with the proxy wallet context from the start
-  
-  // First, create client with proxy wallet settings to derive proper credentials
-  const initClient = new ClobClient(
-    CLOB_API_URL,
-    CHAIN_ID,
-    wallet,
-    undefined,  // no creds yet
-    SIGNATURE_TYPE,
-    FUNDER_ADDRESS
-  );
-  
-  // Create or derive API credentials (this signs with the proxy context)
-  const credentials = await initClient.createOrDeriveApiKey(FUNDER_ADDRESS);
-  console.log('✅ API credentials obtained');
-  console.log(`   API Key: ${credentials.apiKey?.slice(0, 20)}...`);
-  
-  // Create authenticated CLOB client with credentials
+  const signer = new Wallet(privateKey);
+
+  // Step 1: Create temp client and derive credentials (exactly like My-Bot)
+  const creds = await new ClobClient(
+    host,
+    137,
+    signer
+  ).createOrDeriveApiKey();
+
+  const signatureType = 2;
+
+  // Step 2: Create authenticated client with credentials
   clobClient = new ClobClient(
-    CLOB_API_URL,
-    CHAIN_ID,
-    wallet,
-    credentials,
-    SIGNATURE_TYPE,
-    FUNDER_ADDRESS
+    host,
+    137,
+    signer,
+    creds,
+    signatureType,
+    funder
   );
-  
-  // Verify the client is working by checking API key
-  try {
-    const apiKeys = await clobClient.getApiKeys();
-    console.log(`✅ API key verified, ${apiKeys.length} key(s) found`);
-  } catch (e) {
-    console.warn('⚠️  Could not verify API keys:', e.message);
-  }
-  
+
   console.log('✅ CLOB client ready for trading');
-  console.log('\n⚠️  IMPORTANT: Make sure your FUNDER_ADDRESS is your Polymarket proxy wallet');
-  console.log('   (Found under your profile picture on polymarket.com, NOT your MetaMask address)\n');
   
   return clobClient;
 }
@@ -117,6 +100,13 @@ async function setupClobClient() {
 
 async function mirrorTrade(tradeData) {
   const { asset, side, size, price } = tradeData;
+  
+  // Validate required fields
+  if (!asset || !side || !size || !price) {
+    console.error('❌ Cannot mirror trade - missing required fields:');
+    console.error(`   asset: ${asset}, side: ${side}, size: ${size}, price: ${price}`);
+    return null;
+  }
   
   console.log('\n🔄 MIRRORING TRADE...');
   console.log(`   Token ID: ${asset}`);
@@ -139,8 +129,8 @@ async function mirrorTrade(tradeData) {
       size: roundedSize,
       price: roundedPrice,
       feeRateBps: 0,
-      nonce: 0,
-      expiration: 0,
+      // nonce: 0,
+      // expiration: 0,
     };
     
     console.log('📝 Creating order with params:', JSON.stringify(orderParams, null, 2));
@@ -152,11 +142,14 @@ async function mirrorTrade(tradeData) {
     console.log('   Order:', JSON.stringify(order, null, 2));
     
     // Step 2: Post the order (GTC = Good Till Cancelled)
-    const result = await clobClient.postOrder(order, OrderType.GTC);
-    
-    console.log('✅ Order placed successfully!');
-    console.log(`   Order ID: ${result.orderID || result.id || 'N/A'}`);
-    console.log(`   Result:`, JSON.stringify(result, null, 2));
+    const result = await clobClient.postOrder(order, OrderType.IOC);
+    if (result.success) {
+      console.log('Order executedd ✅', result);
+    } else {
+      console.log('Order failed ❌', result);
+    }    
+    // console.log('✅ Order placed successfully!');
+
     
     return result;
   } catch (error) {
@@ -204,7 +197,7 @@ function logTrade(trade) {
 async function fetchTargetActivity() {
   try {
     const response = await fetch(
-      `${DATA_API_URL}/activity?user=${TARGET_ADDRESS}&limit=100`
+      `${DATA_API_URL}/activity?user=${TARGET_ADDRESS}&limit=200`
     );
     
     if (!response.ok) {
@@ -218,6 +211,89 @@ async function fetchTargetActivity() {
     return activity.filter(item => item.type === 'TRADE');
   } catch (error) {
     console.error(`❌ Error fetching activity: ${error.message}`);
+    return [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DUMP RECENT TRADES TO CSV
+// ═══════════════════════════════════════════════════════════════
+
+async function dumpRecentTradesToCSV(secondsAgo = 5, outputFile = 'recent_trades.csv') {
+  console.log(`\n📊 Fetching trades from the last ${secondsAgo} seconds...`);
+  
+  const nowTimestamp = Math.floor(Date.now() / 1000);
+  const cutoffTimestamp = nowTimestamp - secondsAgo;
+  
+  try {
+    // Fetch all activity
+    const trades = await fetchTargetActivity();
+    console.log('trades', trades.length);
+    // Filter trades from the last X seconds
+    // const recentTrades = trades.filter(trade => trade.timestamp >= cutoffTimestamp);
+    const recentTrades = trades;
+    // console.log(`   Found ${recentTrades.length} trades in the last ${secondsAgo} seconds`);
+    
+    if (recentTrades.length === 0) {
+      console.log('   No trades to dump.');
+      return [];
+    }
+    
+    // Log trades to console
+    console.log('\n📋 Recent Trades:');
+    console.log('─'.repeat(80));
+    recentTrades.forEach((trade, idx) => {
+      console.log(`   ${idx + 1}. [${formatTimestamp(trade.timestamp)}] ${trade.side} ${formatSize(trade.size)} @ ${formatPrice(trade.price)}`);
+      console.log(`      Market: ${trade.title}`);
+      console.log(`      Outcome: ${trade.outcome} | USDC: $${parseFloat(trade.usdcSize || 0).toFixed(2)}`);
+    });
+    console.log('─'.repeat(80));
+    
+    // Build CSV content
+    const headers = [
+      'timestamp',
+      'datetime',
+      'side',
+      'price',
+      'size',
+      'usdcSize',
+      'title',
+      'outcome',
+      'asset',
+      'conditionId',
+      'transactionHash',
+      'trader'
+    ];
+    
+    const csvRows = [headers.join(',')];
+    
+    for (const trade of recentTrades) {
+      const row = [
+        trade.timestamp,
+        formatTimestamp(trade.timestamp),
+        trade.side,
+        trade.price,
+        trade.size,
+        trade.usdcSize || 0,
+        `"${(trade.title || '').replace(/"/g, '""')}"`,  // Escape quotes in title
+        `"${(trade.outcome || '').replace(/"/g, '""')}"`,
+        trade.asset,
+        trade.conditionId,
+        trade.transactionHash,
+        trade.name || trade.pseudonym || trade.proxyWallet || ''
+      ];
+      csvRows.push(row.join(','));
+    }
+    
+    const csvContent = csvRows.join('\n');
+    
+    // Write to file
+    fs.writeFileSync(outputFile, csvContent);
+    console.log(`\n✅ Dumped ${recentTrades.length} trades to ${outputFile}`);
+    
+    return recentTrades;
+  } catch (error) {
+    console.error(`❌ Error dumping trades: ${error.message}`);
     return [];
   }
 }
@@ -311,13 +387,16 @@ async function main() {
   console.log('   Real-time trade tracking & execution via CLOB API');
   console.log('═══════════════════════════════════════════════════════════════\n');
   
-  validateConfig();
+  // validateConfig();
   
   // Setup CLOB client for executing trades (for future use)
-  await setupClobClient();
+  // await setupClobClient();
+  
+  // Dump recent trades from last 5 seconds to CSV
+  await dumpRecentTradesToCSV(5, 'recent_trades.csv');
   
   // Start polling for target's trades
-  startPolling();
+  // startPolling();
 }
 
 main();
